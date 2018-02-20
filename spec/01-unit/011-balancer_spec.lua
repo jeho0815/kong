@@ -1,10 +1,12 @@
+local utils = require "kong.tools.utils"
+
 describe("Balancer", function()
   local singletons, balancer
   local UPSTREAMS_FIXTURES
   local TARGETS_FIXTURES
   local crc32 = ngx.crc32_short
   local uuid = require("kong.tools.utils").uuid
-
+  local upstream_hc
 
   teardown(function()
     ngx.log:revert()
@@ -28,14 +30,54 @@ describe("Balancer", function()
       wait_max = 0.5,         -- max wait time before discarding event
     })
 
-    UPSTREAMS_FIXTURES = {
-      { id = "a", name = "mashape", slots = 10 },
-      { id = "b", name = "kong",    slots = 10 },
-      { id = "c", name = "gelato",  slots = 20 },
-      { id = "d", name = "galileo", slots = 20 },
-      { id = "e", name = "upstream_e", slots = 10 },
-      { id = "f", name = "upstream_f", slots = 10 },
+    local hc_defaults = {
+      active = {
+        timeout = 1,
+        concurrency = 10,
+        http_path = "/",
+        healthy = {
+          interval = 0,  -- 0 = probing disabled by default
+          http_statuses = { 200, 302 },
+          successes = 0, -- 0 = disabled by default
+        },
+        unhealthy = {
+          interval = 0, -- 0 = probing disabled by default
+          http_statuses = { 429, 404,
+                            500, 501, 502, 503, 504, 505 },
+          tcp_failures = 0,  -- 0 = disabled by default
+          timeouts = 0,      -- 0 = disabled by default
+          http_failures = 0, -- 0 = disabled by default
+        },
+      },
+      passive = {
+        healthy = {
+          http_statuses = { 200, 201, 202, 203, 204, 205, 206, 207, 208, 226,
+                            300, 301, 302, 303, 304, 305, 306, 307, 308 },
+          successes = 0,
+        },
+        unhealthy = {
+          http_statuses = { 429, 500, 503 },
+          tcp_failures = 0,  -- 0 = circuit-breaker disabled by default
+          timeouts = 0,      -- 0 = circuit-breaker disabled by default
+          http_failures = 0, -- 0 = circuit-breaker disabled by default
+        },
+      },
     }
+
+    local passive_hc = utils.deep_copy(hc_defaults)
+    passive_hc.passive.healthy.successes = 1
+    passive_hc.passive.unhealthy.http_failures = 1
+
+    UPSTREAMS_FIXTURES = {
+      [1] = { id = "a", name = "mashape", slots = 10, healthchecks = hc_defaults },
+      [2] = { id = "b", name = "kong",    slots = 10, healthchecks = hc_defaults },
+      [3] = { id = "c", name = "gelato",  slots = 20, healthchecks = hc_defaults },
+      [4] = { id = "d", name = "galileo", slots = 20, healthchecks = hc_defaults },
+      [5] = { id = "e", name = "upstream_e", slots = 10, healthchecks = hc_defaults },
+      [6] = { id = "f", name = "upstream_f", slots = 10, healthchecks = hc_defaults },
+      [7] = { id = "hc", name = "upstream_hc", slots = 10, healthchecks = passive_hc },
+    }
+    upstream_hc = UPSTREAMS_FIXTURES[7]
 
     TARGETS_FIXTURES = {
       -- 1st upstream; a
@@ -117,6 +159,14 @@ describe("Balancer", function()
         created_at = "003",
         upstream_id = "f",
         target = "127.0.0.1:2112",
+        weight = 10,
+      },
+      -- upstream_hc
+      {
+        id = "hc1",
+        created_at = "001",
+        upstream_id = "hc",
+        target = "localhost:1111",
         weight = 10,
       },
     }
@@ -309,6 +359,44 @@ describe("Balancer", function()
       assert(targets[3].id == "a4")
       assert(targets[4].id == "a1")
     end)
+  end)
+
+  describe("(un)subscribe_to_healthcheck_events()", function()
+    local my_balancer = balancer._create_balancer(upstream_hc)
+    assert.truthy(my_balancer)
+    local hc = balancer._get_healthchecker(my_balancer)
+    assert.truthy(hc)
+    local data = {}
+    local cb = function(upstream_id, ip, port, hostname, health)
+      table.insert(data, {
+        upstream_id = upstream_id,
+        ip = ip,
+        port = port,
+        hostname = hostname,
+        health = health,
+      })
+    end
+    balancer.subscribe_to_healthcheck_events(cb)
+    my_balancer.report_http_status("127.0.0.1", 1111, 429)
+    my_balancer.report_http_status("127.0.0.1", 1111, 200)
+    balancer.unsubscribe_from_healthcheck_events(cb)
+    my_balancer.report_http_status("127.0.0.1", 1111, 429)
+    hc:stop()
+    assert.same({
+      upstream_id = "hc",
+      ip = "127.0.0.1",
+      port = 1111,
+      hostname = "localhost",
+      health = "unhealthy"
+    }, data[1])
+    assert.same({
+      upstream_id = "hc",
+      ip = "127.0.0.1",
+      port = 1111,
+      hostname = "localhost",
+      health = "healthy"
+    }, data[2])
+    assert.same(nil, data[3])
   end)
 
   describe("creating hash values", function()
